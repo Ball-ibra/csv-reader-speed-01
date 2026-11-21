@@ -154,7 +154,14 @@ fn find_bytes(hay: &[u8], mut i: usize, needle: &[u8]) -> Option<usize> {
                     let j = mm.trailing_zeros() as usize;
                     mm &= mm - 1;
                     let cand = i + j;
-                    if cand + needle.len() <= n && &hay[cand..cand + needle.len()] == needle {
+                    // A key's opening quote is never preceded by a
+                    // backslash; a quote inside a JSON string always is.
+                    // That one check rejects every escaped quote in the
+                    // text without paying for the compare.
+                    if cand + needle.len() <= n
+                        && (cand == 0 || hay[cand - 1] != b'\\')
+                        && &hay[cand..cand + needle.len()] == needle
+                    {
                         return Some(cand);
                     }
                 }
@@ -163,7 +170,10 @@ fn find_bytes(hay: &[u8], mut i: usize, needle: &[u8]) -> Option<usize> {
         }
     }
     while i + needle.len() <= n {
-        if hay[i] == first && &hay[i..i + needle.len()] == needle {
+        if hay[i] == first
+            && (i == 0 || hay[i - 1] != b'\\')
+            && &hay[i..i + needle.len()] == needle
+        {
             return Some(i);
         }
         i += 1;
@@ -605,6 +615,14 @@ pub struct State {
     ans: Vec<u8>,
     fields: Vec<Fld>,
     lone: bool,
+    // Raw path: scratch for a record's over-width fields, and the end of the
+    // JSON string being parsed (found when a scan meets its closing quote).
+    extra: Vec<u8>,
+    send: usize,
+    // Fused path: buffered errors (emitted once the header is known) and
+    // the shared bytes of long_row extras.
+    raw_errs: Vec<RawErr>,
+    err_extra: Vec<u8>,
     // Parse state, reset for every csv_answer call.
     ei: usize,
     pos: usize,
@@ -673,6 +691,10 @@ impl State {
             ans: Vec::new(),
             fields: Vec::new(),
             lone: false,
+            extra: Vec::new(),
+            send: 0,
+            raw_errs: Vec::new(),
+            err_extra: Vec::new(),
             ei: 0,
             pos: 0,
             line: 1,
@@ -1135,14 +1157,17 @@ impl State {
     }
 
     /// Transduce the whole cases.json (UTF-8 bytes) into answers.json, in
-    /// one pass. Each case's text is unescaped here and parsed straight from
-    /// the UTF-8 bytes; the answers are written as JSON as they are produced.
-    /// The array is built in self.ans and moved into self.out at the end.
-    /// Returns false if a lone surrogate was seen (the caller falls back for
-    /// that case, since a lone surrogate has no UTF-8 form).
+    /// one pass. Each case's text is parsed straight from the raw bytes --
+    /// no JSON unescape, no event list -- and its answer is appended to
+    /// self.out as it is produced, so there is no per-case copy and no
+    /// second buffer. Returns false if a case needs the per-case fallback
+    /// (a \u escape for a structural character, or a lone surrogate); the
+    /// caller falls back for that case, since the raw path cannot carry it.
     fn cases_to_answers(&mut self, bytes: &[u8]) -> bool {
-        self.ans.clear();
-        self.ans.extend_from_slice(b"[");
+        self.out.clear();
+        self.out.extend_from_slice(b"[");
+        self.out.reserve(bytes.len());
+        self.rows.reserve(bytes.len());
         let n = bytes.len();
         let mut i = 0usize;
         let mut first = true;
@@ -1160,26 +1185,17 @@ impl State {
             if j >= n || bytes[j] != b'"' {
                 break;
             }
-            let (end, len) = parse_json_string(&mut self.text, bytes, j, &mut self.lone);
-            self.text_len = len;
-            i = end;
-            let h = find_bytes(bytes, i, b"\"header\"");
-            let h = match h {
-                Some(v) => v,
-                None => break,
-            };
-            let mut k = skip_ws(bytes, h + 8);
-            if k >= n || bytes[k] != b':' {
-                break;
-            }
-            k = skip_ws(bytes, k + 1);
-            let header = k < n && bytes[k] == b't';
+            // The fused parser reads the header itself from the string
+            // end, after the text is parsed, so there is no second pass
+            // over the text. It returns the header value's position.
             if !first {
-                self.ans.push(b',');
+                self.out.push(b',');
             }
             first = false;
-            self.csv_answer(header);
-            self.ans.extend_from_slice(&self.out);
+            let k = match self.csv_answer_fused(bytes, j + 1) {
+                Some(v) => v,
+                None => return false,
+            };
             // Find the end of this case object so the next search starts
             // after it. The text and header keys were found in order, so the
             // next case starts after the header value.
@@ -1189,9 +1205,8 @@ impl State {
             }
             i = m + 1;
         }
-        self.ans.push(b']');
-        self.out = core::mem::take(&mut self.ans);
-        !self.lone
+        self.out.push(b']');
+        true
     }
 }
 
@@ -1335,4 +1350,1521 @@ pub extern "C" fn bench_events(ptr: usize, len: usize) -> usize {
         i = end;
     }
     total
+}
+
+// ===========================================================================
+// Raw path: parse CSV straight from the raw cases.json bytes.
+//
+// The "text" string is still JSON-escaped in the file, so a field's raw
+// bytes are already the JSON escaping of its value: a clean field is copied
+// to the output as it stands, with no unescape pass, no event list and no
+// escaping scan. One SIMD scan drives the parser directly; only the escapes
+// that change the value ("" inside quotes, CR inside quotes, a stray CR)
+// need a cooked copy. A \u escape for a structural character, or a lone
+// surrogate, bails the whole transduce to the driver's per-case fallback,
+// which answers those cases with the (correct, slower) UTF-8 path.
+// ===========================================================================
+
+/// One field of a raw record: a span of the input bytes, or a range of the
+/// scratch buffer where a cooked value was materialised. Both hold bytes
+/// that are already valid JSON string content, so they are emitted verbatim.
+#[derive(Clone, Copy)]
+struct RawFld {
+    cooked: bool,
+    a: usize,
+    b: usize,
+    ca: usize,
+    cb: usize,
+}
+
+#[inline(always)]
+fn raw_fld_empty(f: &RawFld) -> bool {
+    if f.cooked {
+        f.ca == f.cb
+    } else {
+        f.a == f.b
+    }
+}
+
+/// Emit one raw field as a JSON string (quotes + verbatim bytes).
+#[inline(always)]
+fn emit_raw_fld(out: &mut Vec<u8>, bytes: &[u8], scratch: &[u8], f: &RawFld) {
+    out.push(b'"');
+    if f.cooked {
+        out.extend_from_slice(&scratch[f.ca..f.cb]);
+    } else {
+        out.extend_from_slice(&bytes[f.a..f.b]);
+    }
+    out.push(b'"');
+}
+
+/// What a \uXXXX escape at `p` (bytes[p] == b'\\', bytes[p+1] == b'u') means.
+enum URes {
+    /// Plain content: advance this many bytes (6, or 12 for a surrogate pair).
+    Content(usize),
+    /// A structural character or a lone surrogate: bail to the fallback.
+    Bail,
+}
+
+/// Decode a \uXXXX escape. Structural characters (quote, comma, LF, CR,
+/// backslash) and lone surrogates bail; anything else is plain content and
+/// is copied verbatim (its \uXXXX form is valid JSON for the same character).
+fn raw_u_escape(bytes: &[u8], p: usize) -> URes {
+    let h = |i: usize| -> u32 {
+        let c = bytes.get(i).copied().unwrap_or(0);
+        match c {
+            b'0'..=b'9' => (c - b'0') as u32,
+            b'a'..=b'f' => (c - b'a' + 10) as u32,
+            b'A'..=b'F' => (c - b'A' + 10) as u32,
+            _ => 0,
+        }
+    };
+    let mut v: u32 = 0;
+    for k in 0..4 {
+        v = (v << 4) | h(p + 2 + k);
+    }
+    if (0xD800..0xDC00).contains(&v) {
+        if bytes.get(p + 6).copied().unwrap_or(0) == b'\\'
+            && bytes.get(p + 7).copied().unwrap_or(0) == b'u'
+        {
+            let mut v2: u32 = 0;
+            for k in 0..4 {
+                v2 = (v2 << 4) | h(p + 8 + k);
+            }
+            if (0xDC00..0xE000).contains(&v2) {
+                return URes::Content(12);
+            }
+        }
+        return URes::Bail;
+    }
+    if (0xDC00..0xE000).contains(&v) {
+        return URes::Bail;
+    }
+    if v == 0x22 || v == 0x2C || v == 0x0A || v == 0x0D || v == 0x5C {
+        return URes::Bail;
+    }
+    URes::Content(6)
+}
+
+impl State {
+    /// Materialise a quoted field's raw content (a .. b) into the scratch
+    /// buffer: "" becomes one quote (as \"), and each CRLF or lone CR
+    /// inside becomes one LF (as \n). Everything else is copied as it
+    /// stands, which is already valid JSON string content.
+    fn cook_raw(&mut self, bytes: &[u8], a: usize, b: usize) -> (usize, usize) {
+        let start = self.scratch.len();
+        let mut i = a;
+        let vb = i8x16_splat(92i8);
+        while i < b {
+            // SIMD scan for the next backslash; copy the clean span before
+            // it in one memcpy instead of byte by byte.
+            if i + 16 <= b {
+                let v = unsafe { v128_load(bytes.as_ptr().add(i) as *const v128) };
+                let m = i8x16_bitmask(i8x16_eq(v, vb)) as u32;
+                if m == 0 {
+                    self.scratch.extend_from_slice(&bytes[i..i + 16]);
+                    i += 16;
+                    continue;
+                }
+                let j = m.trailing_zeros() as usize;
+                if j > 0 {
+                    self.scratch.extend_from_slice(&bytes[i..i + j]);
+                    i += j;
+                }
+                // bytes[i] is now a backslash; fall through to the escape.
+            }
+            let c = bytes[i];
+            if c == b'\\' && i + 1 < b {
+                match bytes[i + 1] {
+                    b'"' => {
+                        if i + 3 < b && bytes[i + 2] == b'\\' && bytes[i + 3] == b'"' {
+                            self.scratch.extend_from_slice(b"\\\"");
+                            i += 4;
+                        } else {
+                            self.scratch.extend_from_slice(&bytes[i..i + 2]);
+                            i += 2;
+                        }
+                    }
+                    b'r' => {
+                        // CRLF or lone CR inside quotes: one LF.
+                        self.scratch.extend_from_slice(b"\\n");
+                        if i + 3 < b && bytes[i + 2] == b'\\' && bytes[i + 3] == b'n' {
+                            i += 4;
+                        } else {
+                            i += 2;
+                        }
+                    }
+                    b'u' => {
+                        let take = (b - i).min(6);
+                        self.scratch.extend_from_slice(&bytes[i..i + take]);
+                        i += take;
+                    }
+                    _ => {
+                        self.scratch.extend_from_slice(&bytes[i..i + 2]);
+                        i += 2;
+                    }
+                }
+            } else {
+                self.scratch.push(c);
+                i += 1;
+            }
+        }
+        (start, self.scratch.len())
+    }
+
+    /// Finish a raw field ending at `end`, its last clean span starting at
+    /// `seg`. `cooked` is Some(scratch start) when the field is being
+    /// materialised in the scratch buffer. Sets `kept` when junk content
+    /// was kept (used for the quote_junk decision).
+    fn finish_raw_field(
+        &mut self,
+        bytes: &[u8],
+        cooked: Option<usize>,
+        seg: usize,
+        end: usize,
+        kept: &mut bool,
+    ) -> RawFld {
+        match cooked {
+            Some(cs) => {
+                if end > seg {
+                    *kept = true;
+                    self.scratch.extend_from_slice(&bytes[seg..end]);
+                }
+                RawFld {
+                    cooked: true,
+                    a: 0,
+                    b: 0,
+                    ca: cs,
+                    cb: self.scratch.len(),
+                }
+            }
+            None => {
+                if end > seg {
+                    *kept = true;
+                }
+                RawFld {
+                    cooked: false,
+                    a: seg,
+                    b: end,
+                    ca: 0,
+                    cb: 0,
+                }
+            }
+        }
+    }
+
+    /// Read an unquoted field starting at self.pos, driven by a SIMD scan
+    /// of the raw bytes for comma, backslash and the string-ending quote.
+    /// Returns the field, a terminator code (0 comma, 1 line break, 2 end
+    /// of string, 3 bail to the fallback) and whether any junk content was
+    /// kept. With a prefix (junk after a closing quote) the field is cooked
+    /// into the scratch buffer. A quote or backslash inside an unquoted
+    /// field is literal content; a stray CR is dropped and reported; CRLF
+    /// ends the record as one line break.
+    fn scan_unquoted_raw(
+        &mut self,
+        bytes: &[u8],
+        prefix: Option<RawFld>,
+    ) -> (RawFld, u8, bool) {
+        let mut cooked: Option<usize> = None;
+        if let Some(p) = prefix {
+            if p.cooked {
+                cooked = Some(p.ca);
+            } else {
+                let cs = self.scratch.len();
+                self.scratch.extend_from_slice(&bytes[p.a..p.b]);
+                cooked = Some(cs);
+            }
+        }
+        let mut kept = false;
+        let mut seg = self.pos;
+        let mut pos = self.pos;
+        let end = bytes.len();
+        unsafe {
+            let sp_comma = i8x16_splat(b',' as i8);
+            let sp_bs = i8x16_splat(b'\\' as i8);
+            let sp_quote = i8x16_splat(b'"' as i8);
+            while pos + 16 <= end {
+                let cs = pos;
+                let v = v128_load(bytes.as_ptr().add(cs) as *const v128);
+                let mut m = (i8x16_bitmask(i8x16_eq(v, sp_comma))
+                    | i8x16_bitmask(i8x16_eq(v, sp_bs))
+                    | i8x16_bitmask(i8x16_eq(v, sp_quote))) as u32;
+                if m == 0 {
+                    pos = cs + 16;
+                    continue;
+                }
+                let mut past = false;
+                while m != 0 {
+                    let k = pos - cs;
+                    if k >= 16 {
+                        break;
+                    }
+                    m &= !((1u32 << k) - 1);
+                    if m == 0 {
+                        break;
+                    }
+                    let j = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let p = cs + j;
+                    let b = bytes[p];
+                    if b == b'"' {
+                        // End of the JSON string.
+                        let f = self.finish_raw_field(bytes, cooked, seg, p, &mut kept);
+                        self.pos = p;
+                        self.send = p;
+                        return (f, 2, kept);
+                    } else if b == b',' {
+                        let f = self.finish_raw_field(bytes, cooked, seg, p, &mut kept);
+                        self.pos = p + 1;
+                        return (f, 0, kept);
+                    } else {
+                        // Backslash at p: classify the escape.
+                        let e = bytes.get(p + 1).copied().unwrap_or(0);
+                        match e {
+                            b'n' => {
+                                let f =
+                                    self.finish_raw_field(bytes, cooked, seg, p, &mut kept);
+                                self.pos = p + 2;
+                                self.line += 1;
+                                return (f, 1, kept);
+                            }
+                            b'r' => {
+                                if bytes.get(p + 2).copied().unwrap_or(0) == b'\\'
+                                    && bytes.get(p + 3).copied().unwrap_or(0) == b'n'
+                                {
+                                    let f = self.finish_raw_field(
+                                        bytes, cooked, seg, p, &mut kept,
+                                    );
+                                    self.pos = p + 4;
+                                    self.line += 1;
+                                    return (f, 1, kept);
+                                }
+                                // Stray CR: dropped, reported, no line.
+                                self.err("stray_cr");
+                                if cooked.is_none() {
+                                    cooked = Some(self.scratch.len());
+                                }
+                                if p > seg {
+                                    kept = true;
+                                    self.scratch.extend_from_slice(&bytes[seg..p]);
+                                }
+                                seg = p + 2;
+                                pos = p + 2;
+                            }
+                            b'"' => {
+                                pos = p + 2;
+                            }
+                            b'u' => match raw_u_escape(bytes, p) {
+                                URes::Content(n) => {
+                                    pos = p + n;
+                                }
+                                URes::Bail => {
+                                    self.pos = p;
+                                    return (
+                                        RawFld {
+                                            cooked: false,
+                                            a: 0,
+                                            b: 0,
+                                            ca: 0,
+                                            cb: 0,
+                                        },
+                                        3,
+                                        kept,
+                                    );
+                                }
+                            },
+                            _ => {
+                                pos = p + 2;
+                            }
+                        }
+                        if pos > cs + 16 {
+                            past = true;
+                            break;
+                        }
+                    }
+                }
+                if !past {
+                    pos = cs + 16;
+                }
+            }
+        }
+        // Scalar tail.
+        while pos < end {
+            let b = bytes[pos];
+            if b == b'"' {
+                let f = self.finish_raw_field(bytes, cooked, seg, pos, &mut kept);
+                self.pos = pos;
+                self.send = pos;
+                return (f, 2, kept);
+            }
+            if b == b',' {
+                let f = self.finish_raw_field(bytes, cooked, seg, pos, &mut kept);
+                self.pos = pos + 1;
+                return (f, 0, kept);
+            }
+            if b == b'\\' {
+                let e = bytes.get(pos + 1).copied().unwrap_or(0);
+                match e {
+                    b'n' => {
+                        let f =
+                            self.finish_raw_field(bytes, cooked, seg, pos, &mut kept);
+                        self.pos = pos + 2;
+                        self.line += 1;
+                        return (f, 1, kept);
+                    }
+                    b'r' => {
+                        if bytes.get(pos + 2).copied().unwrap_or(0) == b'\\'
+                            && bytes.get(pos + 3).copied().unwrap_or(0) == b'n'
+                        {
+                            let f = self.finish_raw_field(
+                                bytes, cooked, seg, pos, &mut kept,
+                            );
+                            self.pos = pos + 4;
+                            self.line += 1;
+                            return (f, 1, kept);
+                        }
+                        self.err("stray_cr");
+                        if cooked.is_none() {
+                            cooked = Some(self.scratch.len());
+                        }
+                        if pos > seg {
+                            kept = true;
+                            self.scratch.extend_from_slice(&bytes[seg..pos]);
+                        }
+                        seg = pos + 2;
+                        pos += 2;
+                        continue;
+                    }
+                    b'u' => match raw_u_escape(bytes, pos) {
+                        URes::Content(n) => {
+                            pos += n;
+                        }
+                        URes::Bail => {
+                            self.pos = pos;
+                            return (
+                                RawFld {
+                                    cooked: false,
+                                    a: 0,
+                                    b: 0,
+                                    ca: 0,
+                                    cb: 0,
+                                },
+                                3,
+                                kept,
+                            );
+                        }
+                    },
+                    _ => {
+                        pos += 2;
+                        continue;
+                    }
+                }
+                continue;
+            }
+            pos += 1;
+        }
+        let f = self.finish_raw_field(bytes, cooked, seg, end, &mut kept);
+        self.pos = end;
+        (f, 2, kept)
+    }
+
+    /// Read a quoted field starting at self.pos (which holds a `\"`).
+    /// Returns the field and a terminator code (0 comma, 1 line break, 2 end
+    /// of string, 3 bail). The walk finds the closing quote by doubling: a
+    /// quote followed by another quote is an escaped quote, not a close.
+    /// A field with no closing quote is re-read as an unquoted field
+    /// starting just after the opening quote, with the opening quote kept
+    /// as a literal prefix.
+    fn read_quoted_raw(&mut self, bytes: &[u8]) -> (RawFld, u8) {
+        let open = self.pos;
+        let open_line = self.line;
+        let mut pos = open + 2;
+        let mut cooked = false;
+        let end = bytes.len();
+        let mut close: Option<usize> = None;
+        let mut done = false;
+        unsafe {
+            let sp_bs = i8x16_splat(b'\\' as i8);
+            let sp_quote = i8x16_splat(b'"' as i8);
+            while !done && pos + 16 <= end {
+                let cs = pos;
+                let v = v128_load(bytes.as_ptr().add(cs) as *const v128);
+                let mut m = (i8x16_bitmask(i8x16_eq(v, sp_bs))
+                    | i8x16_bitmask(i8x16_eq(v, sp_quote))) as u32;
+                if m == 0 {
+                    pos = cs + 16;
+                    continue;
+                }
+                let mut past = false;
+                while m != 0 {
+                    let k = pos - cs;
+                    if k >= 16 {
+                        break;
+                    }
+                    m &= !((1u32 << k) - 1);
+                    if m == 0 {
+                        break;
+                    }
+                    let j = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let p = cs + j;
+                    let b = bytes[p];
+                    if b == b'"' {
+                        // End of the JSON string: unterminated quote.
+                        done = true;
+                        break;
+                    }
+                    // Backslash at p: classify the escape.
+                    let e = bytes.get(p + 1).copied().unwrap_or(0);
+                    match e {
+                        b'"' => {
+                            if bytes.get(p + 2).copied().unwrap_or(0) == b'\\'
+                                && bytes.get(p + 3).copied().unwrap_or(0) == b'"'
+                            {
+                                cooked = true;
+                                pos = p + 4;
+                            } else {
+                                close = Some(p);
+                                pos = p + 2;
+                                done = true;
+                                break;
+                            }
+                        }
+                        b'n' => {
+                            self.line += 1;
+                            pos = p + 2;
+                        }
+                        b'r' => {
+                            // CRLF inside quotes is one line: consume the
+                            // pair together, or a lone CR on its own.
+                            self.line += 1;
+                            cooked = true;
+                            if bytes.get(p + 2).copied().unwrap_or(0) == b'\\'
+                                && bytes.get(p + 3).copied().unwrap_or(0) == b'n'
+                            {
+                                pos = p + 4;
+                            } else {
+                                pos = p + 2;
+                            }
+                        }
+                        b'u' => match raw_u_escape(bytes, p) {
+                            URes::Content(n) => {
+                                pos = p + n;
+                            }
+                            URes::Bail => {
+                                self.pos = p;
+                                return (
+                                    RawFld {
+                                        cooked: false,
+                                        a: 0,
+                                        b: 0,
+                                        ca: 0,
+                                        cb: 0,
+                                    },
+                                    3,
+                                );
+                            }
+                        },
+                        _ => {
+                            pos = p + 2;
+                        }
+                    }
+                    if pos > cs + 16 {
+                        past = true;
+                        break;
+                    }
+                }
+                if !past {
+                    pos = cs + 16;
+                }
+            }
+        }
+        // Scalar tail.
+        while !done && pos < end {
+            let b = bytes[pos];
+            if b == b'"' {
+                done = true;
+                break;
+            }
+            if b == b'\\' {
+                let e = bytes.get(pos + 1).copied().unwrap_or(0);
+                match e {
+                    b'"' => {
+                        if bytes.get(pos + 2).copied().unwrap_or(0) == b'\\'
+                            && bytes.get(pos + 3).copied().unwrap_or(0) == b'"'
+                        {
+                            cooked = true;
+                            pos += 4;
+                        } else {
+                            close = Some(pos);
+                            pos += 2;
+                            done = true;
+                            break;
+                        }
+                    }
+                    b'n' => {
+                        self.line += 1;
+                        pos += 2;
+                    }
+                    b'r' => {
+                        self.line += 1;
+                        cooked = true;
+                        if bytes.get(pos + 2).copied().unwrap_or(0) == b'\\'
+                            && bytes.get(pos + 3).copied().unwrap_or(0) == b'n'
+                        {
+                            pos += 4;
+                        } else {
+                            pos += 2;
+                        }
+                    }
+                    b'u' => match raw_u_escape(bytes, pos) {
+                        URes::Content(n) => {
+                            pos += n;
+                        }
+                        URes::Bail => {
+                            self.pos = pos;
+                            return (
+                                RawFld {
+                                    cooked: false,
+                                    a: 0,
+                                    b: 0,
+                                    ca: 0,
+                                    cb: 0,
+                                },
+                                3,
+                            );
+                        }
+                    },
+                    _ => {
+                        pos += 2;
+                    }
+                }
+                continue;
+            }
+            pos += 1;
+        }
+        let close = match close {
+            Some(c) => c,
+            None => {
+                self.err("unterminated_quote");
+                self.pos = open + 2;
+                self.line = open_line;
+                let cs = self.scratch.len();
+                self.scratch.extend_from_slice(b"\\\"");
+                let (f, term, _) = self.scan_unquoted_raw(
+                    bytes,
+                    Some(RawFld {
+                        cooked: true,
+                        a: 0,
+                        b: 0,
+                        ca: cs,
+                        cb: cs + 2,
+                    }),
+                );
+                return (f, term);
+            }
+        };
+        let fld = if !cooked {
+            RawFld {
+                cooked: false,
+                a: open + 2,
+                b: close,
+                ca: 0,
+                cb: 0,
+            }
+        } else {
+            let (ca, cb) = self.cook_raw(bytes, open + 2, close);
+            RawFld {
+                cooked: true,
+                a: 0,
+                b: 0,
+                ca,
+                cb,
+            }
+        };
+        let after = close + 2;
+        // String end right after the closing quote.
+        if after >= end || bytes[after] == b'"' {
+            self.pos = after;
+            if after < end {
+                self.send = after;
+            }
+            return (fld, 2);
+        }
+        let c = bytes[after];
+        if c == b',' {
+            self.pos = after + 1;
+            return (fld, 0);
+        }
+        if c == b'\\' {
+            let e = bytes.get(after + 1).copied().unwrap_or(0);
+            if e == b'n' {
+                self.pos = after + 2;
+                self.line += 1;
+                return (fld, 1);
+            }
+            if e == b'r'
+                && bytes.get(after + 2).copied().unwrap_or(0) == b'\\'
+                && bytes.get(after + 3).copied().unwrap_or(0) == b'n'
+            {
+                self.pos = after + 4;
+                self.line += 1;
+                return (fld, 1);
+            }
+        }
+        // Junk after the closing quote: it joins the field as literal text,
+        // and anything at all kept makes it a quote_junk error.
+        self.pos = after;
+        let (f, term, kept) = self.scan_unquoted_raw(bytes, Some(fld));
+        if term == 3 {
+            return (f, 3);
+        }
+        if kept {
+            self.err("quote_junk");
+        }
+        (f, term)
+    }
+
+    /// Parse the CSV text in `bytes` starting at `start` (the first byte of
+    /// the JSON string's content) for one {text, header} case and write the
+    /// JSON of its answer to self.out. The fields are emitted straight into
+    /// the answer buffers as they are read, so each byte is handled once.
+    /// Returns false when the text needs the per-case fallback (a \u escape
+    /// for a structural character, or a lone surrogate).
+    fn csv_answer_raw(&mut self, bytes: &[u8], start: usize, header: bool) -> bool {
+        // The answer is appended to self.out (the cases array being built);
+        // only the staging buffers are cleared per case.
+        self.scratch.clear();
+        self.col.clear();
+        self.rows.clear();
+        self.errs.clear();
+        self.extra.clear();
+        let n0 = bytes.len();
+        self.rows.reserve(n0);
+        self.out.reserve(n0);
+        self.send = bytes.len();
+        self.pos = if bytes.len() >= start + 3
+            && bytes[start] == 0xEF
+            && bytes[start + 1] == 0xBB
+            && bytes[start + 2] == 0xBF
+        {
+            start + 3
+        } else {
+            start
+        };
+        self.line = 1;
+        self.width = -1;
+        self.rows_n = 0;
+        self.cols_done = false;
+        self.err_first = true;
+        self.header = header;
+        loop {
+            // Skip empty lines.
+            while self.pos < self.send {
+                let p = self.pos;
+                if bytes[p] == b'"' {
+                    break;
+                }
+                if bytes[p] == b'\\' && bytes.get(p + 1).copied().unwrap_or(0) == b'n' {
+                    self.pos = p + 2;
+                    self.line += 1;
+                } else if bytes[p] == b'\\'
+                    && bytes.get(p + 1).copied().unwrap_or(0) == b'r'
+                    && bytes.get(p + 2).copied().unwrap_or(0) == b'\\'
+                    && bytes.get(p + 3).copied().unwrap_or(0) == b'n'
+                {
+                    self.pos = p + 4;
+                    self.line += 1;
+                } else {
+                    break;
+                }
+            }
+            if self.pos >= self.send {
+                break;
+            }
+            self.rec_line = self.line;
+            self.rec_row = if self.header && !self.cols_done {
+                None
+            } else {
+                Some(self.rows_n)
+            };
+            let first_rec = !self.cols_done;
+            let to_col = first_rec && header;
+            let mark = if to_col { self.col.len() } else { self.rows.len() };
+            if !to_col && !self.rows.is_empty() {
+                self.rows.push(b',');
+            }
+            if to_col {
+                self.col.push(b'[');
+            } else {
+                self.rows.push(b'[');
+            }
+            self.extra.clear();
+            let mut fidx = 0usize;
+            let mut term = 2u8;
+            let mut first_empty = false;
+            let mut first_quoted = false;
+            loop {
+                let quoted = bytes.get(self.pos).copied().unwrap_or(0) == b'\\'
+                    && bytes.get(self.pos + 1).copied().unwrap_or(0) == b'"';
+                let (f, t) = if quoted {
+                    self.read_quoted_raw(bytes)
+                } else {
+                    let (f, t, _) = self.scan_unquoted_raw(bytes, None);
+                    (f, t)
+                };
+                if t == 3 {
+                    return false;
+                }
+                if fidx == 0 {
+                    first_empty = raw_fld_empty(&f);
+                    first_quoted = quoted;
+                }
+                // Route the field: to the target buffer, or to the extra
+                // list when it runs past the record width.
+                if !first_rec && (fidx as i32) >= self.width {
+                    if fidx > self.width as usize {
+                        self.extra.push(b',');
+                    }
+                    emit_raw_fld(&mut self.extra, bytes, &self.scratch, &f);
+                } else if to_col {
+                    if fidx > 0 {
+                        self.col.push(b',');
+                    }
+                    emit_raw_fld(&mut self.col, bytes, &self.scratch, &f);
+                } else {
+                    if fidx > 0 {
+                        self.rows.push(b',');
+                    }
+                    emit_raw_fld(&mut self.rows, bytes, &self.scratch, &f);
+                }
+                fidx += 1;
+                term = t;
+                if t != 0 {
+                    break;
+                }
+            }
+            // A record of one empty unquoted field is no record.
+            if fidx == 1 && first_empty && !first_quoted {
+                if to_col {
+                    self.col.truncate(mark);
+                } else {
+                    self.rows.truncate(mark);
+                }
+                continue;
+            }
+            if first_rec {
+                self.cols_done = true;
+                self.width = fidx as i32;
+            } else if (fidx as i32) < self.width {
+                self.err_prefix("short_row");
+                self.errs.extend_from_slice(b",\"fields\":");
+                push_u32(&mut self.errs, fidx as u32);
+                self.errs.push(b'}');
+                for _ in fidx..self.width as usize {
+                    self.rows.extend_from_slice(b",\"\"");
+                }
+            } else if (fidx as i32) > self.width {
+                self.err_prefix("long_row");
+                self.errs.extend_from_slice(b",\"extra\":[");
+                self.errs.extend_from_slice(&self.extra);
+                self.errs.extend_from_slice(b"]}");
+            }
+            if to_col {
+                self.col.push(b']');
+            } else {
+                self.rows.push(b']');
+                self.rows_n += 1;
+            }
+            if term == 2 {
+                break;
+            }
+        }
+        self.out.extend_from_slice(b"{\"columns\":");
+        if self.col.is_empty() {
+            // No header record was read: [] when a header was expected,
+            // null when it was not.
+            if self.header {
+                self.out.extend_from_slice(b"[]");
+            } else {
+                self.out.extend_from_slice(b"null");
+            }
+        } else {
+            self.out.extend_from_slice(&self.col);
+        }
+        self.out.extend_from_slice(b",\"rows\":[");
+        self.out.extend_from_slice(&self.rows);
+        self.out.extend_from_slice(b"],\"errors\":[");
+        self.out.extend_from_slice(&self.errs);
+        self.out.extend_from_slice(b"]}");
+        true
+    }
+}
+
+
+/// One buffered error. `rec` is the record index among all records
+/// (0-based, first record = 0); the emitted `row` depends on the header,
+/// which is only known after the text is parsed, so errors are buffered
+/// here and written to the answer at the end of the case.
+#[derive(Clone, Copy)]
+struct RawErr {
+    code: u8, // 0 stray_cr, 1 quote_junk, 2 unterminated_quote, 3 short_row, 4 long_row
+    line: u32,
+    rec: u32,
+    fields: u32,
+    ex_a: usize,
+    ex_b: usize,
+}
+
+impl State {
+    /// Fused raw parser: one SIMD scan loop per text drives quoted and
+    /// unquoted fields, record boundaries and output inline. No separate
+    /// unescape pass, no per-field function calls, no header search pass
+    /// (the header is read from the string end after the parse, and the
+    /// first record is staged until then). Returns the position of the
+    /// header value (`true`/`false`) on success, or None to bail to the
+    /// driver's per-case fallback. The event semantics mirror
+    /// scan_unquoted_raw / read_quoted_raw exactly: a raw quote is the
+    /// JSON string end, `\"` closes a quoted field unless doubled, `\n`
+    /// and `\r\n` are line breaks, a lone `\r` is a stray CR.
+    fn csv_answer_fused(&mut self, bytes: &[u8], start: usize) -> Option<usize> {
+        let end = bytes.len();
+        let bp = bytes.as_ptr();
+        let vq = i8x16_splat(34i8); // quote
+        let vc = i8x16_splat(44i8); // comma
+        let vb = i8x16_splat(92i8); // backslash
+        self.scratch.clear();
+        self.col.clear();
+        self.rows.clear();
+        self.errs.clear();
+        self.extra.clear();
+        self.stage.clear();
+        self.raw_errs.clear();
+        self.err_extra.clear();
+        // BOM at the start of the text.
+        let mut pos = if end >= start + 3
+            && bytes[start] == 0xEF
+            && bytes[start + 1] == 0xBB
+            && bytes[start + 2] == 0xBF
+        {
+            start + 3
+        } else {
+            start
+        };
+        let mut line: u32 = 1;
+        let mut send = end;
+        let mut width: usize = 0;
+        let mut first_done = false;
+        let mut rec_idx: u32 = 0;
+        'record: loop {
+            // Skip empty lines: a \n escape or a \r\n escape pair.
+            while pos < send {
+                let p = pos;
+                if bytes[p] == b'"' {
+                    break;
+                }
+                if bytes[p] == b'\\'
+                    && bytes.get(p + 1).copied().unwrap_or(0) == b'n'
+                {
+                    pos = p + 2;
+                    line += 1;
+                } else if bytes[p] == b'\\'
+                    && bytes.get(p + 1).copied().unwrap_or(0) == b'r'
+                    && bytes.get(p + 2).copied().unwrap_or(0) == b'\\'
+                    && bytes.get(p + 3).copied().unwrap_or(0) == b'n'
+                {
+                    pos = p + 4;
+                    line += 1;
+                } else {
+                    break;
+                }
+            }
+            if pos >= send {
+                break 'record;
+            }
+            let rec_line = line;
+            let rec = rec_idx;
+            let first = !first_done;
+            let mark = if first {
+                let m = self.stage.len();
+                self.stage.push(b'[');
+                m
+            } else {
+                let m = self.rows.len();
+                if !self.rows.is_empty() {
+                    self.rows.push(b',');
+                }
+                self.rows.push(b'[');
+                m
+            };
+            self.extra.clear();
+            let mut fidx = 0usize;
+            let mut term = 2u8;
+            let mut first_empty = false;
+            let mut first_quoted = false;
+            'field: loop {
+                let quoted = bytes.get(pos).copied().unwrap_or(0) == b'\\'
+                    && bytes.get(pos + 1).copied().unwrap_or(0) == b'"';
+                let mut in_quotes = quoted;
+                let mut seg = pos;
+                let mut open = pos;
+                let mut open_line = line;
+                if quoted {
+                    open = pos;
+                    open_line = line;
+                    pos += 2;
+                    seg = pos;
+                }
+                if fidx == 0 {
+                    first_quoted = quoted;
+                }
+                let mut cooked: Option<usize> = None;
+                let mut qcooked = false;
+                let mut junk_mode = false;
+                let mut kept = false;
+                // One unified scan for this field.
+                let (ffld, fterm) = 'scan: loop {
+                    // 16-byte SIMD chunks.
+                    while pos + 16 <= end {
+                        let cs = pos;
+                        let v = unsafe { v128_load(bp.add(cs) as *const v128) };
+                        let mut m = (i8x16_bitmask(i8x16_eq(v, vq))
+                            | i8x16_bitmask(i8x16_eq(v, vc))
+                            | i8x16_bitmask(i8x16_eq(v, vb))) as u32;
+                        if m == 0 {
+                            pos = cs + 16;
+                            continue;
+                        }
+                        let mut past = false;
+                        while m != 0 {
+                            let j = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            let p = cs + j;
+                            let b = bytes[p];
+                            if b == 34 {
+                                // A raw quote is the JSON string end.
+                                if in_quotes {
+                                    // Unterminated quote: re-read as an
+                                    // unquoted field from just after the
+                                    // opening quote, keeping the quote.
+                                    self.raw_errs.push(RawErr { code: 2, line: rec_line, rec, fields: 0, ex_a: 0, ex_b: 0 });
+                                    let cs0 = self.scratch.len();
+                                    self.scratch.extend_from_slice(b"\\\"");
+                                    cooked = Some(cs0);
+                                    pos = open + 2;
+                                    line = open_line;
+                                    seg = pos;
+                                    in_quotes = false;
+                                    qcooked = false;
+                                    junk_mode = false;
+                                    kept = false;
+                                    continue 'scan;
+                                }
+                                let f = self.finish_raw_field(bytes, cooked, seg, p, &mut kept);
+                                send = p;
+                                break 'scan (f, 2);
+                            }
+                            if b == 44 {
+                                if in_quotes {
+                                    // A comma inside quotes is content.
+                                    pos = p + 1;
+                                    continue;
+                                }
+                                let f = self.finish_raw_field(bytes, cooked, seg, p, &mut kept);
+                                pos = p + 1;
+                                break 'scan (f, 0);
+                            }
+                            // Backslash at p: classify the escape.
+                            let e = bytes.get(p + 1).copied().unwrap_or(0);
+                            if in_quotes {
+                                match e {
+                                    b'"' => {
+                                        if bytes.get(p + 2).copied().unwrap_or(0) == b'\\'
+                                            && bytes.get(p + 3).copied().unwrap_or(0) == b'"'
+                                        {
+                                            qcooked = true;
+                                            pos = p + 4;
+                                        } else {
+                                            // Closing quote at p.
+                                            let (ca, cb) = if qcooked {
+                                                self.cook_raw(bytes, open + 2, p)
+                                            } else {
+                                                (0, 0)
+                                            };
+                                            let after = p + 2;
+                                            if after >= end || bytes[after] == b'"' {
+                                                let f = if qcooked {
+                                                    RawFld { cooked: true, a: 0, b: 0, ca, cb }
+                                                } else {
+                                                    RawFld { cooked: false, a: open + 2, b: p, ca: 0, cb: 0 }
+                                                };
+                                                if after < end {
+                                                    send = after;
+                                                }
+                                                pos = after;
+                                                break 'scan (f, 2);
+                                            }
+                                            let nb = bytes[after];
+                                            if nb == b',' {
+                                                let f = if qcooked {
+                                                    RawFld { cooked: true, a: 0, b: 0, ca, cb }
+                                                } else {
+                                                    RawFld { cooked: false, a: open + 2, b: p, ca: 0, cb: 0 }
+                                                };
+                                                pos = after + 1;
+                                                break 'scan (f, 0);
+                                            }
+                                            if nb == b'\\' {
+                                                let e2 = bytes.get(after + 1).copied().unwrap_or(0);
+                                                if e2 == b'n' {
+                                                    let f = if qcooked {
+                                                        RawFld { cooked: true, a: 0, b: 0, ca, cb }
+                                                    } else {
+                                                        RawFld { cooked: false, a: open + 2, b: p, ca: 0, cb: 0 }
+                                                    };
+                                                    pos = after + 2;
+                                                    line += 1;
+                                                    break 'scan (f, 1);
+                                                }
+                                                if e2 == b'r'
+                                                    && bytes.get(after + 2).copied().unwrap_or(0) == b'\\'
+                                                    && bytes.get(after + 3).copied().unwrap_or(0) == b'n'
+                                                {
+                                                    let f = if qcooked {
+                                                        RawFld { cooked: true, a: 0, b: 0, ca, cb }
+                                                    } else {
+                                                        RawFld { cooked: false, a: open + 2, b: p, ca: 0, cb: 0 }
+                                                    };
+                                                    pos = after + 4;
+                                                    line += 1;
+                                                    break 'scan (f, 1);
+                                                }
+                                            }
+                                            // Junk after the close: the
+                                            // field becomes cooked and the
+                                            // scan continues unquoted.
+                                            if qcooked {
+                                                cooked = Some(ca);
+                                            } else {
+                                                let cs0 = self.scratch.len();
+                                                self.scratch.extend_from_slice(&bytes[open + 2..p]);
+                                                cooked = Some(cs0);
+                                            }
+                                            seg = after;
+                                            in_quotes = false;
+                                            junk_mode = true;
+                                            kept = false;
+                                            pos = after;
+                                            continue 'scan;
+                                        }
+                                    }
+                                    b'n' => {
+                                        line += 1;
+                                        pos = p + 2;
+                                    }
+                                    b'r' => {
+                                        line += 1;
+                                        qcooked = true;
+                                        if bytes.get(p + 2).copied().unwrap_or(0) == b'\\'
+                                            && bytes.get(p + 3).copied().unwrap_or(0) == b'n'
+                                        {
+                                            pos = p + 4;
+                                        } else {
+                                            pos = p + 2;
+                                        }
+                                    }
+                                    b'u' => match raw_u_escape(bytes, p) {
+                                        URes::Content(n) => {
+                                            pos = p + n;
+                                        }
+                                        URes::Bail => {
+                                            return None;
+                                        }
+                                    },
+                                    _ => {
+                                        pos = p + 2;
+                                    }
+                                }
+                            } else {
+                                match e {
+                                    b'n' => {
+                                        let f = self.finish_raw_field(bytes, cooked, seg, p, &mut kept);
+                                        pos = p + 2;
+                                        line += 1;
+                                        break 'scan (f, 1);
+                                    }
+                                    b'r' => {
+                                        if bytes.get(p + 2).copied().unwrap_or(0) == b'\\'
+                                            && bytes.get(p + 3).copied().unwrap_or(0) == b'n'
+                                        {
+                                            let f = self.finish_raw_field(bytes, cooked, seg, p, &mut kept);
+                                            pos = p + 4;
+                                            line += 1;
+                                            break 'scan (f, 1);
+                                        }
+                                        // Stray CR: dropped, reported.
+                                        self.raw_errs.push(RawErr { code: 0, line: rec_line, rec, fields: 0, ex_a: 0, ex_b: 0 });
+                                        if cooked.is_none() {
+                                            cooked = Some(self.scratch.len());
+                                        }
+                                        if p > seg {
+                                            kept = true;
+                                            self.scratch.extend_from_slice(&bytes[seg..p]);
+                                        }
+                                        seg = p + 2;
+                                        pos = p + 2;
+                                    }
+                                    b'u' => match raw_u_escape(bytes, p) {
+                                        URes::Content(n) => {
+                                            pos = p + n;
+                                        }
+                                        URes::Bail => {
+                                            return None;
+                                        }
+                                    },
+                                    _ => {
+                                        pos = p + 2;
+                                    }
+                                }
+                            }
+                            if pos > cs + 16 {
+                                past = true;
+                                break;
+                            }
+                            // Mask off bits an escape just consumed, so a
+                            // quote or comma inside an escape is not read as
+                            // an event of its own. Only backslash handlers
+                            // advance pos past the event itself.
+                            m &= !((1u32 << (pos - cs)) - 1);
+                        }
+                        if !past {
+                            pos = cs + 16;
+                        }
+                    }
+                    // Scalar tail.
+                    while pos < end {
+                        let b = bytes[pos];
+                        if b == 34 {
+                            if in_quotes {
+                                self.raw_errs.push(RawErr { code: 2, line: rec_line, rec, fields: 0, ex_a: 0, ex_b: 0 });
+                                let cs0 = self.scratch.len();
+                                self.scratch.extend_from_slice(b"\\\"");
+                                cooked = Some(cs0);
+                                pos = open + 2;
+                                line = open_line;
+                                seg = pos;
+                                in_quotes = false;
+                                qcooked = false;
+                                junk_mode = false;
+                                kept = false;
+                                continue 'scan;
+                            }
+                            let f = self.finish_raw_field(bytes, cooked, seg, pos, &mut kept);
+                            send = pos;
+                            break 'scan (f, 2);
+                        }
+                        if b == 44 {
+                            if in_quotes {
+                                pos += 1;
+                                continue;
+                            }
+                            let f = self.finish_raw_field(bytes, cooked, seg, pos, &mut kept);
+                            pos += 1;
+                            break 'scan (f, 0);
+                        }
+                        if b == 92 {
+                            let e = bytes.get(pos + 1).copied().unwrap_or(0);
+                            if in_quotes {
+                                match e {
+                                    b'"' => {
+                                        if bytes.get(pos + 2).copied().unwrap_or(0) == b'\\'
+                                            && bytes.get(pos + 3).copied().unwrap_or(0) == b'"'
+                                        {
+                                            qcooked = true;
+                                            pos += 4;
+                                        } else {
+                                            let (ca, cb) = if qcooked {
+                                                self.cook_raw(bytes, open + 2, pos)
+                                            } else {
+                                                (0, 0)
+                                            };
+                                            let after = pos + 2;
+                                            if after >= end || bytes[after] == b'"' {
+                                                let f = if qcooked {
+                                                    RawFld { cooked: true, a: 0, b: 0, ca, cb }
+                                                } else {
+                                                    RawFld { cooked: false, a: open + 2, b: pos, ca: 0, cb: 0 }
+                                                };
+                                                if after < end {
+                                                    send = after;
+                                                }
+                                                pos = after;
+                                                break 'scan (f, 2);
+                                            }
+                                            let nb = bytes[after];
+                                            if nb == b',' {
+                                                let f = if qcooked {
+                                                    RawFld { cooked: true, a: 0, b: 0, ca, cb }
+                                                } else {
+                                                    RawFld { cooked: false, a: open + 2, b: pos, ca: 0, cb: 0 }
+                                                };
+                                                pos = after + 1;
+                                                break 'scan (f, 0);
+                                            }
+                                            if nb == b'\\' {
+                                                let e2 = bytes.get(after + 1).copied().unwrap_or(0);
+                                                if e2 == b'n' {
+                                                    let f = if qcooked {
+                                                        RawFld { cooked: true, a: 0, b: 0, ca, cb }
+                                                    } else {
+                                                        RawFld { cooked: false, a: open + 2, b: pos, ca: 0, cb: 0 }
+                                                    };
+                                                    pos = after + 2;
+                                                    line += 1;
+                                                    break 'scan (f, 1);
+                                                }
+                                                if e2 == b'r'
+                                                    && bytes.get(after + 2).copied().unwrap_or(0) == b'\\'
+                                                    && bytes.get(after + 3).copied().unwrap_or(0) == b'n'
+                                                {
+                                                    let f = if qcooked {
+                                                        RawFld { cooked: true, a: 0, b: 0, ca, cb }
+                                                    } else {
+                                                        RawFld { cooked: false, a: open + 2, b: pos, ca: 0, cb: 0 }
+                                                    };
+                                                    pos = after + 4;
+                                                    line += 1;
+                                                    break 'scan (f, 1);
+                                                }
+                                            }
+                                            if qcooked {
+                                                cooked = Some(ca);
+                                            } else {
+                                                let cs0 = self.scratch.len();
+                                                self.scratch.extend_from_slice(&bytes[open + 2..pos]);
+                                                cooked = Some(cs0);
+                                            }
+                                            seg = after;
+                                            in_quotes = false;
+                                            junk_mode = true;
+                                            kept = false;
+                                            pos = after;
+                                            continue 'scan;
+                                        }
+                                    }
+                                    b'n' => {
+                                        line += 1;
+                                        pos += 2;
+                                    }
+                                    b'r' => {
+                                        line += 1;
+                                        qcooked = true;
+                                        if bytes.get(pos + 2).copied().unwrap_or(0) == b'\\'
+                                            && bytes.get(pos + 3).copied().unwrap_or(0) == b'n'
+                                        {
+                                            pos += 4;
+                                        } else {
+                                            pos += 2;
+                                        }
+                                    }
+                                    b'u' => match raw_u_escape(bytes, pos) {
+                                        URes::Content(n) => {
+                                            pos += n;
+                                        }
+                                        URes::Bail => {
+                                            return None;
+                                        }
+                                    },
+                                    _ => {
+                                        pos += 2;
+                                    }
+                                }
+                            } else {
+                                match e {
+                                    b'n' => {
+                                        let f = self.finish_raw_field(bytes, cooked, seg, pos, &mut kept);
+                                        pos += 2;
+                                        line += 1;
+                                        break 'scan (f, 1);
+                                    }
+                                    b'r' => {
+                                        if bytes.get(pos + 2).copied().unwrap_or(0) == b'\\'
+                                            && bytes.get(pos + 3).copied().unwrap_or(0) == b'n'
+                                        {
+                                            let f = self.finish_raw_field(bytes, cooked, seg, pos, &mut kept);
+                                            pos += 4;
+                                            line += 1;
+                                            break 'scan (f, 1);
+                                        }
+                                        self.raw_errs.push(RawErr { code: 0, line: rec_line, rec, fields: 0, ex_a: 0, ex_b: 0 });
+                                        if cooked.is_none() {
+                                            cooked = Some(self.scratch.len());
+                                        }
+                                        if pos > seg {
+                                            kept = true;
+                                            self.scratch.extend_from_slice(&bytes[seg..pos]);
+                                        }
+                                        seg = pos + 2;
+                                        pos += 2;
+                                        continue;
+                                    }
+                                    b'u' => match raw_u_escape(bytes, pos) {
+                                        URes::Content(n) => {
+                                            pos += n;
+                                        }
+                                        URes::Bail => {
+                                            return None;
+                                        }
+                                    },
+                                    _ => {
+                                        pos += 2;
+                                        continue;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        pos += 1;
+                    }
+                    // Buffer end: string end (or the file's end).
+                    let f = self.finish_raw_field(bytes, cooked, seg, pos, &mut kept);
+                    send = pos;
+                    break 'scan (f, 2);
+                };
+                // Field end: quote_junk, then route + emit.
+                if junk_mode && kept {
+                    self.raw_errs.push(RawErr { code: 1, line: rec_line, rec, fields: 0, ex_a: 0, ex_b: 0 });
+                }
+                if fidx == 0 {
+                    first_empty = raw_fld_empty(&ffld);
+                }
+                if !first && fidx >= width {
+                    if fidx > width {
+                        self.extra.push(b',');
+                    }
+                    emit_raw_fld(&mut self.extra, bytes, &self.scratch, &ffld);
+                } else if first {
+                    if fidx > 0 {
+                        self.stage.push(b',');
+                    }
+                    emit_raw_fld(&mut self.stage, bytes, &self.scratch, &ffld);
+                } else {
+                    if fidx > 0 {
+                        self.rows.push(b',');
+                    }
+                    emit_raw_fld(&mut self.rows, bytes, &self.scratch, &ffld);
+                }
+                fidx += 1;
+                term = fterm;
+                if fterm != 0 {
+                    break 'field;
+                }
+            }
+            // Record end.
+            if fidx == 1 && first_empty && !first_quoted {
+                // Empty single field: not a record.
+                if first {
+                    self.stage.truncate(mark);
+                } else {
+                    self.rows.truncate(mark);
+                }
+                self.extra.clear();
+                continue 'record;
+            }
+            if first {
+                first_done = true;
+                width = fidx;
+                self.stage.push(b']');
+            } else {
+                if fidx < width {
+                    self.raw_errs.push(RawErr { code: 3, line: rec_line, rec, fields: fidx as u32, ex_a: 0, ex_b: 0 });
+                    for _ in fidx..width {
+                        self.rows.extend_from_slice(b",\"\"");
+                    }
+                } else if fidx > width {
+                    let a = self.err_extra.len();
+                    self.err_extra.extend_from_slice(&self.extra);
+                    let b = self.err_extra.len();
+                    self.raw_errs.push(RawErr { code: 4, line: rec_line, rec, fields: 0, ex_a: a, ex_b: b });
+                }
+                self.rows.push(b']');
+            }
+            self.extra.clear();
+            rec_idx += 1;
+            if term == 2 {
+                break 'record;
+            }
+        }
+        // Header: right after the string end.
+        let h = match find_bytes(bytes, send, b"\"header\"") {
+            Some(h) => h,
+            None => return None,
+        };
+        let mut k = skip_ws(bytes, h + 8);
+        if bytes.get(k) != Some(&b':') {
+            return None;
+        }
+        k = skip_ws(bytes, k + 1);
+        let header = match bytes.get(k) {
+            Some(b't') => true,
+            Some(b'f') => false,
+            _ => return None,
+        };
+        let kval = k;
+        // Assemble the answer into self.out (append mode).
+        self.out.extend_from_slice(b"{\"columns\":");
+        if header {
+            if self.stage.is_empty() {
+                self.out.extend_from_slice(b"[]");
+            } else {
+                self.out.extend_from_slice(&self.stage);
+            }
+        } else {
+            self.out.extend_from_slice(b"null");
+        }
+        self.out.extend_from_slice(b",\"rows\":[");
+        if !header && !self.stage.is_empty() {
+            self.out.extend_from_slice(&self.stage);
+            if !self.rows.is_empty() {
+                self.out.push(b',');
+            }
+        }
+        self.out.extend_from_slice(&self.rows);
+        self.out.extend_from_slice(b"],\"errors\":[");
+        let mut first_e = true;
+        for e in &self.raw_errs {
+            if !first_e {
+                self.out.push(b',');
+            }
+            first_e = false;
+            self.out.extend_from_slice(b"{\"code\":\"");
+            self.out.extend_from_slice(match e.code {
+                0 => b"stray_cr",
+                1 => b"quote_junk",
+                2 => b"unterminated_quote",
+                3 => b"short_row",
+                _ => b"long_row",
+            });
+            self.out.extend_from_slice(b"\",\"line\":");
+            push_u32(&mut self.out, e.line);
+            self.out.extend_from_slice(b",\"row\":");
+            if header && e.rec == 0 {
+                self.out.extend_from_slice(b"null");
+            } else {
+                push_u32(&mut self.out, if header { e.rec - 1 } else { e.rec });
+            }
+            if e.code == 3 {
+                self.out.extend_from_slice(b",\"fields\":");
+                push_u32(&mut self.out, e.fields);
+            } else if e.code == 4 {
+                self.out.extend_from_slice(b",\"extra\":[");
+                self.out.extend_from_slice(&self.err_extra[e.ex_a..e.ex_b]);
+                self.out.push(b']');
+            }
+            self.out.push(b'}');
+        }
+        self.out.extend_from_slice(b"]}");
+        Some(kval)
+    }
 }
